@@ -1,0 +1,391 @@
+<!--
+  Copyright (C) 2020  Dirk Toewe
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+<!DOCTYPE html>
+<html>
+ <head>
+   <meta http-equiv="content-type" content="text/html; charset=UTF-8">
+   <meta charset="utf-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+   <title>CoViD-19 Time Series Plot</title>
+   <script id="plotly-script" src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+ </head>
+ <body>
+   <script id="data" type="text/javascript">
+'use strict';
+const OFFLINE_COPY = false;
+const POPCOUNTS = fetch('https://raw.githubusercontent.com/samayo/country-json/master/src/country-by-population.json').then(res => res.json());
+const COVID19_DATA = Promise.all([
+  'time_series_covid19_confirmed_global.csv',
+  'time_series_covid19_recovered_global.csv',
+  'time_series_covid19_deaths_global.csv'
+].map(
+  filename => fetch('https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/' + filename)
+    .then(res => res.text())
+));
+   </script>
+
+   <script type="text/javascript">
+'use strict';
+
+( async () => {
+  const DOM_COPY = document.cloneNode(/*deep=*/true);
+  if( ! OFFLINE_COPY )
+  {
+    DOM_COPY.getElementById('data').textContent = `
+'use strict';
+const OFFLINE_COPY = true,
+      POPCOUNTS    = Promise.resolve(${JSON.stringify(await POPCOUNTS)}),
+      COVID19_DATA = Promise.resolve(${JSON.stringify(await COVID19_DATA)});
+`;
+    const plotly_script = DOM_COPY.getElementById('plotly-script');
+    plotly_script.innerHTML = await fetch(`https://raw.githubusercontent.com/plotly/plotly.js/v${Plotly.version}/dist/plotly.min.js`).then(res => res.text());
+    plotly_script.removeAttribute('src');
+  }
+
+  const [
+    COVID19_CONFIRMED,
+    COVID19_RECOVERED,
+    COVID19_DEATHS
+  ] = await COVID19_DATA;
+
+  const popcount = {};
+  for( const {country,population} of await POPCOUNTS )
+    popcount[country] = population;
+
+  // renaming to make popcounts compatible to CoViD-19 data
+  popcount['US'] = popcount['United States'];
+  popcount['Korea, South'] = popcount['South Korea'];
+  popcount['Russia'] = popcount['Russian Federation'];
+  popcount['Congo (Kinshasa)'] = popcount['The Democratic Republic of Congo'];
+  popcount['Congo'] = popcount['Congo'];
+  popcount['Sri Lanka'] = popcount['SriLanka'];
+  popcount['Czechia'] = popcount['Czech Republic'];
+
+  function parse_csv( csv )
+  {
+    let [head,...data] = csv.split('\n').map(
+      row => {
+        const result = [];
+
+        for( let i=0; i < row.length; i++ )
+        {
+          let j=i;
+          if( row[i] == '"' )
+          {
+            while(row[++j] != '"') {
+              if( j >= row.length )
+                throw new Error('Assertion failed.');
+
+              j += (row[j] == '\\');
+            }
+            ++j;
+
+            if( j < row.length && row[j] != ',' )
+              throw new Error('Assertion failed.');
+
+            result.push( JSON.parse(row.slice(i,j)) );
+          }
+          else
+          {
+            while( j < row.length && row[j] != ',' ) {
+              ++j;
+            }
+
+            result.push( row.slice(i,j) );
+          }
+          i=j;
+        }
+
+        return result;
+      }
+    );
+
+    const counts = {};
+
+    loop:for( let row of data )
+    {
+      const country = row[1];
+      row = Float64Array.from(row.slice(4));
+
+      if( !(country in popcount) ) {
+        console.warn(`Missing population count of '${country}'`);
+        continue loop;
+      }
+
+      if( country in counts )
+      {
+        for( let i=row.length; i-- > 0; )
+          counts[country][i] += row[i];
+      }
+      else
+        counts[country] = row;
+    }
+
+    return Object.freeze([
+      head.slice(4),
+      counts
+    ]);
+  }
+
+  const [deaths_time,   deaths_data] = parse_csv(COVID19_DEATHS),
+        [  sick_time,     sick_data] = function(){
+          const [confirmed_time,confirmed_data] = parse_csv(COVID19_CONFIRMED),
+                [recovered_time,recovered_data] = parse_csv(COVID19_RECOVERED);
+        
+          if( confirmed_time.length !== recovered_time.length )
+            throw new Error('Assertion failed.');
+        
+          for( let i=confirmed_time.length; i-- > 0; )
+            if( confirmed_time[i] !== recovered_time[i] )
+              throw new Error('Assertion failed.');
+        
+          const sick_time = deaths_time,
+                sick_data = {};
+
+          for( const [country,confirmed] of Object.entries(confirmed_data) )
+          {
+            const recovered = recovered_data[country];
+
+            if( recovered.length !== confirmed.length )
+              throw new Error('Assertion failed.');
+
+            sick_data[country] = confirmed.map( (confirm,i) => confirm - recovered[i] );
+          }
+
+          return Object.freeze([sick_time, sick_data]);
+        }();
+
+  const text_data = {};
+  for( const [country,deaths] of Object.entries(deaths_data) )
+  {
+    const txt = [],
+         sick = sick_data[country];
+
+    const str = num => {
+      num *= 1;
+      if( num <= 0 ) return num.toString();
+      let str = '';
+      while( num >= 1000 ) {
+        str = ',' + (num%1000).toString().padStart(3,'0') + str;
+        num = Math.floor(num/1000);
+      }
+      str = num + str;
+      return str;
+    };
+
+    for( let i=0; i < deaths.length; i++ )
+    {
+      const deaths_i = str(deaths[i]),
+              sick_i = str(  sick[i]);
+      txt.push(`Deaths: ${deaths_i}<br>Deaths+Sick: ${sick_i}`);
+    }
+
+    text_data[country] = txt;
+  }
+  Object.freeze(text_data);
+  console.log(text_data);
+
+  for( const data of [sick_data, deaths_data] )
+  for( const [country,cases] of Object.entries(data) )
+  {
+    const count = popcount[country];
+
+    for( let i=cases.length; i-- > 0; )
+      cases[i] *= 1000/count;
+  }
+
+  const data_sick   = [],
+        data_deaths = [];
+
+  const whitelist = new Set([
+    'Switzerland',
+    'Austria',
+    'Germany',
+    'Netherlands',
+    'Denmark',
+    'Belgium',
+    'France',
+    'Greece',
+    'Czechia',
+    'Poland',
+    'Luxemburg',
+    'China',
+    'Korea, South',
+    'United Kingdom',
+    'Japan',
+    'San Marino',
+    'Italy',
+    'US',
+    'Russia',
+    'Spain',
+    'Turkey',
+    'Sweden',
+    'Norway',
+    'Iran',
+    'Liechtenstein',
+    'Ireland',
+    'India',
+    'Brazil',
+    'Slovakia',
+    'Belarus',
+    'Finland',
+    'Ukraine',
+    'Portugal',
+    'Parkistan',
+    'Thailand',
+    'Shanghai',
+    'Hungary',
+    'Mexico',
+    'Egypt',
+    'Croatia'
+  ]);
+
+  const vislist = new Set([
+    'US',
+    'France',
+    'Italy',
+    'Spain',
+    'Greece',
+    'Netherlands',
+    'Sweden',
+    'Belgium',
+    'Germany'
+  ]);
+
+  for( const [country,y] of Object.entries(sick_data).sort() )
+  {
+    if( whitelist.has(country) )
+      data_sick.push({
+        type: 'scattergl',
+        name: country,
+        text: text_data[country],
+        x: sick_time,
+        y,
+        visible: vislist.has(country) || 'legendonly'
+      });
+  }
+
+  for( const [country,y] of Object.entries(deaths_data).sort() )
+  {
+    if( whitelist.has(country) )
+      data_deaths.push({
+        type: 'scattergl',
+        name: country,
+        text: text_data[country],
+        x: deaths_time,
+        y,
+        visible: vislist.has(country) || 'legendonly'
+      });
+  }
+
+  const layout = {
+    hovermode: 'closest',
+    xaxis: {
+      title: 'Date',
+    },
+    yaxis: {
+      type: 'linear'
+    }
+  };
+
+  const input_log = document.createElement('input');
+  input_log.type = 'checkbox';
+  input_log.checked = false;
+  document.body.appendChild(input_log);
+
+  ;{
+    const label = document.createElement('label');
+    label.innerHTML = 'Logarithmic';
+    document.body.appendChild(label);
+  };
+
+  const input_deaths = document.createElement('input');
+  input_deaths.type = 'checkbox';
+  input_deaths.checked = false;
+  document.body.appendChild(input_deaths);
+
+  ;{
+    const label = document.createElement('label');
+    label.innerHTML = 'Deaths';
+    document.body.appendChild(label);
+  };
+
+  const latest_date = function(){
+    let [m,d,y] = deaths_time[deaths_time.length-1].split('/');
+    y = y*1 + 2000;
+    m = m-1;
+    d = d*1;
+    return new Date(y,m,d);
+  }();
+
+  if( ! OFFLINE_COPY )
+  {
+    const button_save = document.createElement('button');
+    button_save.innerHTML = 'Save Offline Copy';
+    document.body.appendChild(button_save);
+
+    button_save.onclick = () => {
+      var xml = new XMLSerializer();
+      var dom_str = xml.serializeToString(DOM_COPY)
+        .replace(/&gt;/g,  '>')
+        .replace(/&lt;/g,  '<')
+        .replace(/&amp;/g, '&');
+      const blob = new Blob([dom_str], {type : 'text/html'});
+
+      const y = latest_date.getFullYear(),
+            m = (latest_date.getMonth()+1).toString().padStart(2,'0'),
+            d = (latest_date.getDate ()  ).toString().padStart(2,'0');
+      const date_str = `${y}-${m}-${d}`;
+      console.log(date_str);
+
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `CoViD-19_plot_${date_str}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    };
+
+    button_save.title='Save a copy that can be viewed without any internet connection.';
+  }
+
+  document.body.appendChild(
+    document.createElement('br')
+  );
+
+  const plot = document.createElement('div');
+  plot.style = `width: 100%; height:95vh;`;
+  document.body.appendChild(plot);
+
+  input_log.onchange = () => {
+    layout.yaxis.type = input_log.checked ? 'log' : 'linear';
+    Plotly.relayout(plot, layout);
+  }
+
+  input_deaths.onchange = () => {
+    const data = input_deaths.checked ? data_deaths : data_sick,
+        config = {responsive: true};
+    layout.title = `<b>CoViD-19 Deaths${input_deaths.checked ? '' : ' + Sick'} per Capita</b> (${latest_date.toLocaleDateString()})<br>Population Counts: <i>https://github.com/samayo/country-json</i><br>Case Data: <i>https://github.com/CSSEGISandData/COVID-19</i>`;
+    layout.yaxis.title = (input_deaths.checked ? 'Deaths' : 'Deaths+Sick') + ' per Capita [‰]';
+    Plotly.react(plot, {data,layout,config});
+  }
+
+  input_deaths.onchange();
+})();
+   </script>
+ </body>
+</html>
